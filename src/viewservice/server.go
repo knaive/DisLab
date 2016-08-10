@@ -20,6 +20,7 @@ type ViewServer struct {
 	latest       int
 	primaryTimer int
 	backupTimer  int
+    ackedView    uint
 	lock         chan string
 }
 
@@ -31,14 +32,18 @@ func (vs *ViewServer) nextView() View {
 	return vs.views[index%4]
 }
 func (vs *ViewServer) setView(view View) {
+    fmt.Println(view, vs.currentView())
 	vs.latest++
 	vs.views[vs.latest%4] = view
 }
 func (vs *ViewServer) currentView() View {
 	return vs.views[vs.cur%4]
 }
-func (vs *ViewServer) updateView() {
-	vs.cur++
+func (vs *ViewServer) updateView(ack uint) {
+    vs.ackedView = ack
+    if vs.cur < vs.latest {
+        vs.cur++
+    }
 }
 
 //
@@ -54,26 +59,28 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 		if view.Backup == "" {
 			if args.Viewnum == view.Viewnum {
 				vs.setView(View{Viewnum: 1, Primary: args.Me, Backup: ""})
+                vs.updateView(0)
 			}
-		} else {
-			num := vs.nextView().Viewnum
-			vs.setView(View{Viewnum: num, Primary: view.Backup, Backup: ""})
-		}
+		} 
 	} else {
-		if args.Me != view.Primary && view.Backup == "" {
-			v := view
-			v.Backup = args.Me
-			v.Viewnum = vs.nextView().Viewnum
-			vs.setView(v)
-		}
 		if args.Me == view.Primary {
 			if args.Viewnum >= view.Viewnum {
-				vs.updateView()
-			} else {
-				v := view
-				v.Primary = ""
-				vs.setView(v)
-			}
+				vs.updateView(args.Viewnum)
+			} 
+            if args.Viewnum == 0 {
+                if vs.ackedView == view.Viewnum {
+                    vs.setView(View{Viewnum:view.Viewnum+1, Primary:view.Backup, Backup:""})
+                    vs.updateView(vs.ackedView)
+                }
+            }
+		} else if view.Backup == "" {
+			v := view
+			v.Backup = args.Me
+			v.Viewnum = vs.nextView().Viewnum+1
+			vs.setView(v)
+            if vs.ackedView == view.Viewnum {
+                vs.updateView(vs.ackedView)
+            }
 		}
 	}
 
@@ -82,7 +89,7 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	} else if args.Me == view.Backup {
 		vs.backupTimer = 0
 	}
-	reply.View = vs.nextView()
+	reply.View = vs.currentView()
 	<-vs.lock
 	vs.mu.Unlock()
 
@@ -94,8 +101,7 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 //
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
-	// reply.View = vs.currentView()
-	reply.View = vs.nextView()
+	reply.View = vs.currentView()
 
 	return nil
 }
@@ -112,15 +118,21 @@ func (vs *ViewServer) tick() {
 	vs.primaryTimer++
 	view := vs.currentView()
 	if vs.primaryTimer == 5 {
-		num := uint(vs.latest + 1)
-		vs.setView(View{Primary: view.Backup, Backup: "", Viewnum: num})
-		vs.primaryTimer = 0
+        if vs.ackedView == view.Viewnum {
+            num := uint(vs.latest + 1)
+            vs.setView(View{Primary: view.Backup, Backup: "", Viewnum: num})
+            vs.updateView(vs.ackedView)
+        }
+        vs.primaryTimer = 0
 	}
 
 	vs.backupTimer++
 	if vs.backupTimer == 5 {
-		num := uint(vs.latest + 1)
-		vs.setView(View{Primary: view.Primary, Backup: "", Viewnum: num})
+        if vs.ackedView == view.Viewnum {
+            num := uint(vs.latest + 1)
+            vs.setView(View{Primary: view.Primary, Backup: "", Viewnum: num})
+            vs.updateView(vs.ackedView)
+        }
 		vs.backupTimer = 0
 	}
 	<-vs.lock
@@ -148,6 +160,7 @@ func StartServer(me string) *ViewServer {
 	vs.lock = make(chan string, 1)
 	vs.cur = 0
 	vs.latest = 0
+    vs.ackedView = 0
 	// Your vs.* initializations here.
 
 	// tell net/rpc about our RPC server and handlers.
