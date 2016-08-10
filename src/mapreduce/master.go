@@ -4,7 +4,7 @@ import "fmt"
 
 type WorkerInfo struct {
   address string
-  // You can add definitions here.
+  free bool
 }
 
 
@@ -26,7 +26,101 @@ func (mr *MapReduce) KillWorkers() *list.List {
   return l
 }
 
+func (mr *MapReduce) FindFree(workerReady chan string) string {
+    for {
+        for addr, info := range mr.Workers {
+            if info.free {
+                return addr
+            }
+        }
+        <-workerReady
+    }
+}
+
+func (mr *MapReduce) Schedule(operation JobType, round int, failedWorkers, freeWorkers, workerReady chan string, done chan bool) {
+    args := &DoJobArgs{}
+    reply := &DoJobReply{}
+
+    args.File = mr.file
+    args.JobNumber = round
+    args.Operation = operation
+    if operation == Map {
+        args.NumOtherPhase = mr.nReduce
+    } else {
+        args.NumOtherPhase = mr.nMap
+    }
+
+    for {
+        addr := <-freeWorkers
+        ok := call(addr, "Worker.DoJob", args, reply)
+        DPrintf("%s, %s, round %d\n", addr, operation, round)
+        if ok {
+            if _, exist := mr.Workers[addr]; !exist {
+                DPrintf("%s not exist", addr)
+            }
+            mr.Workers[addr].free = true
+            done <- true
+            workerReady <- addr
+            return
+        }
+        DPrintf("%s failed,%s,round%d\n", addr, operation, round)
+        failedWorkers <- addr
+    }
+}
+
 func (mr *MapReduce) RunMaster() *list.List {
-  // Your code here
-  return mr.KillWorkers()
+    // Your code here
+    onePhaseDone := make(chan bool)
+    failedWorkers := make(chan string)
+    freeWorkers := make(chan string)
+    workerReady := make(chan string)
+
+    // purge failed workers
+    go func() {
+        for {
+            addr := <-failedWorkers
+            delete(mr.Workers, addr)
+        }
+    }()
+
+    // find a free worker and assign a job to it
+    go func() {
+        for {
+            addr := mr.FindFree(workerReady)
+            mr.Workers[addr].free = false
+            freeWorkers <- addr
+        }
+    }()
+    
+    // get new workers ready
+    go func() {
+        for {
+            worker := <-mr.registerChannel
+            info := &WorkerInfo{}
+            info.address = worker
+            info.free = true
+            mr.Workers[worker] = info
+            workerReady <- worker
+        }
+    }()
+
+    for i := 0; i < mr.nMap; i++ {
+        go mr.Schedule(Map, i, failedWorkers, freeWorkers, workerReady, onePhaseDone)
+    }
+
+    // map done
+    for i := 0; i < mr.nMap; i++ {
+        <-onePhaseDone
+    }
+
+    for i :=0; i < mr.nReduce; i++ {
+        go mr.Schedule(Reduce, i, failedWorkers, freeWorkers, workerReady, onePhaseDone)
+    }
+
+    // reduce done
+    for i := 0; i < mr.nReduce; i++ {
+        <-onePhaseDone
+    }
+
+    return mr.KillWorkers()
 }
