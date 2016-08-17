@@ -8,6 +8,9 @@ import "sync"
 import "fmt"
 import "os"
 
+const len = 2
+const Debug = 0
+
 type ViewServer struct {
 	mu   sync.Mutex
 	l    net.Listener
@@ -15,35 +18,38 @@ type ViewServer struct {
 	me   string
 
 	// Your declarations here.
-	views        [4]View
+	views        [len]View
 	cur          int
 	latest       int
 	primaryTimer int
 	backupTimer  int
-    ackedView    uint
+	ackedView    uint
 	lock         chan string
 }
 
-func (vs *ViewServer) nextView() View {
-	index := vs.cur + 1
-	if index > vs.latest {
-		index = vs.latest
+func DPrint(strs ...interface{}) {
+	if Debug > 0 {
+		fmt.Println(strs)
 	}
-	return vs.views[index%4]
+}
+
+func (vs *ViewServer) latestView() View {
+	return vs.views[vs.latest%len]
 }
 func (vs *ViewServer) setView(view View) {
-    fmt.Println(view, vs.currentView())
+	DPrint(view, vs.currentView(), vs.ackedView)
 	vs.latest++
-	vs.views[vs.latest%4] = view
+	vs.views[vs.latest%len] = view
 }
 func (vs *ViewServer) currentView() View {
-	return vs.views[vs.cur%4]
+	return vs.views[vs.cur%len]
 }
 func (vs *ViewServer) updateView(ack uint) {
-    vs.ackedView = ack
-    if vs.cur < vs.latest {
-        vs.cur++
-    }
+	vs.ackedView = ack
+	if vs.cur < vs.latest {
+		vs.cur++
+	}
+	DPrint("update: ", vs.currentView(), vs.ackedView)
 }
 
 //
@@ -55,32 +61,35 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	vs.mu.Lock()
 	vs.lock <- "locked"
 	view := vs.currentView()
+	latest := vs.latestView()
 	if view.Primary == "" {
-		if view.Backup == "" {
-			if args.Viewnum == view.Viewnum {
-				vs.setView(View{Viewnum: 1, Primary: args.Me, Backup: ""})
-                vs.updateView(0)
-			}
-		} 
+		if view.Backup == "" && args.Viewnum == view.Viewnum { // No primary or backup, so make the caller as primary if it knows current state
+			DPrint(args.Me)
+			vs.setView(View{Viewnum: 1, Primary: args.Me, Backup: ""})
+			vs.updateView(0)
+		}
 	} else {
-		if args.Me == view.Primary {
-			if args.Viewnum >= view.Viewnum {
+		if args.Me == view.Primary { // caller is primary
+			if args.Viewnum >= view.Viewnum { // ack
 				vs.updateView(args.Viewnum)
-			} 
-            if args.Viewnum == 0 {
-                if vs.ackedView == view.Viewnum {
-                    vs.setView(View{Viewnum:view.Viewnum+1, Primary:view.Backup, Backup:""})
-                    vs.updateView(vs.ackedView)
-                }
-            }
-		} else if view.Backup == "" {
+			}
+			if args.Viewnum == 0 { // primary acking view 0 means it's restarted and should be considered as dead
+				DPrint("current view: ", view, vs.ackedView)
+				if vs.ackedView == view.Viewnum { // current view is acked, we can update
+					DPrint(args.Me)
+					vs.setView(View{Viewnum: view.Viewnum + 1, Primary: view.Backup, Backup: ""})
+					vs.updateView(vs.ackedView)
+				}
+			}
+		} else if latest.Backup == "" { // caller is not primary and we have primary but no backup
 			v := view
 			v.Backup = args.Me
-			v.Viewnum = vs.nextView().Viewnum+1
+			v.Viewnum = latest.Viewnum + 1
+			DPrint(args.Me)
 			vs.setView(v)
-            if vs.ackedView == view.Viewnum {
-                vs.updateView(vs.ackedView)
-            }
+			if vs.ackedView == view.Viewnum {
+				vs.updateView(vs.ackedView)
+			}
 		}
 	}
 
@@ -118,21 +127,21 @@ func (vs *ViewServer) tick() {
 	vs.primaryTimer++
 	view := vs.currentView()
 	if vs.primaryTimer == 5 {
-        if vs.ackedView == view.Viewnum {
-            num := uint(vs.latest + 1)
-            vs.setView(View{Primary: view.Backup, Backup: "", Viewnum: num})
-            vs.updateView(vs.ackedView)
-        }
-        vs.primaryTimer = 0
+		if vs.ackedView == view.Viewnum {
+			num := uint(vs.latest + 1)
+			vs.setView(View{Primary: view.Backup, Backup: "", Viewnum: num})
+			vs.updateView(vs.ackedView)
+		}
+		vs.primaryTimer = 0
 	}
 
 	vs.backupTimer++
 	if vs.backupTimer == 5 {
-        if vs.ackedView == view.Viewnum {
-            num := uint(vs.latest + 1)
-            vs.setView(View{Primary: view.Primary, Backup: "", Viewnum: num})
-            vs.updateView(vs.ackedView)
-        }
+		if vs.ackedView == view.Viewnum {
+			num := uint(vs.latest + 1)
+			vs.setView(View{Primary: view.Primary, Backup: "", Viewnum: num})
+			vs.updateView(vs.ackedView)
+		}
 		vs.backupTimer = 0
 	}
 	<-vs.lock
@@ -153,14 +162,12 @@ func StartServer(me string) *ViewServer {
 	vs.me = me
 	vs.mu = sync.Mutex{}
 	vs.dead = false
-	// vs.view = View{Viewnum: 0, Primary: "", Backup: ""}
-	// vs.newView = View{Viewnum: 0, Primary: "", Backup: ""}
 	vs.primaryTimer = 0
 	vs.backupTimer = 0
 	vs.lock = make(chan string, 1)
 	vs.cur = 0
 	vs.latest = 0
-    vs.ackedView = 0
+	vs.ackedView = 0
 	// Your vs.* initializations here.
 
 	// tell net/rpc about our RPC server and handlers.
